@@ -90,3 +90,7 @@ Contributions are welcome but please follow this rule:
 ## About
 
 Created as an advanced example for educational purposes. The author is not responsible for misuse. Use only with permission and be mindful of safety and legal constraints.
+
+
+## Credits;
+- **tigr0w / ZeroMemoryEx_Handle-Ripper** — Primary inspiration for handle enumeration and ripper techniques: https://github.com/tigr0w/ZeroMemoryEx_Handle-Ripper. The algorithms for querying process handle tables and duplicating handles were especially useful.  
