@@ -23,23 +23,16 @@ const (
 
 	statusMismatch = 0xC0000004
 	statusSuccess  = 0x00000000
-	statusNoMore   = 0x8000001A
 	queryInfo      = 0x0400
 	dupHandle      = 0x0040
 	handleClass    = 51
 	typeClass      = 2
-	dosPath        = 0
 	diskType       = 1
-	createAlways   = 2
 	normalAttr     = 0x80
 
 	fileStandardInfo = 5
 	filePositionInfo = 14
 	fileNameInfo     = 9
-
-	maxPath         = 32768
-	fileOpenIf      = 3
-	fileSyncIoAlert = 0x00000010
 )
 
 type Handle struct {
